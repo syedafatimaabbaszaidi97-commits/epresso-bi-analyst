@@ -301,7 +301,7 @@ def build_sales_model(tables: dict):
                             if not rep['changed'] else rep['warning']),
         })
     model['Channel'] = model['Channel'].fillna('Unknown')
-    return model, pd.DataFrame(checks)
+    return add_store_label(model), pd.DataFrame(checks)
 
 
 def total_revenue(model: pd.DataFrame) -> float:
@@ -350,3 +350,64 @@ def sales_quality_issues(sales: pd.DataFrame, tables: dict) -> pd.DataFrame:
     add('StoreYear does not match Store ID + year', bad_sy.fillna(True).sum(),
         'StoreYear links Sales to the Survey; a mismatch breaks that link.')
     return pd.DataFrame(issues)
+
+
+# ======================================================= DASHBOARD (step 4)
+# The sidebar filters map to these model columns. Options always come from
+# the loaded data, never typed in.
+FILTER_COLUMNS = {'Year': 'Year', 'Store': 'Store', 'Category': 'Category', 'Channel': 'Channel'}
+
+
+def add_store_label(model: pd.DataFrame) -> pd.DataFrame:
+    """Readable store name, e.g. 'SH11 - Chicago, IL' or 'SH00 - Website'."""
+    out = model.copy()
+    city = out['City'].astype('string').fillna('')
+    state = out['State'].astype('string').fillna('')
+    place = (city + ', ' + state).str.strip(', ')
+    place = place.where(place != '', out['StoreType'].astype('string').fillna('Unknown'))
+    out['Store'] = out['Store ID'].astype('string') + ' - ' + place
+    out['Category'] = out['Category'].astype('string').fillna('Unknown')
+    return out
+
+
+def filter_options(model: pd.DataFrame) -> dict:
+    """Sorted list of values for each filter, from the loaded data."""
+    return {label: sorted(model[col].dropna().unique().tolist())
+            for label, col in FILTER_COLUMNS.items()}
+
+
+def filter_model(model: pd.DataFrame, selections: dict) -> pd.DataFrame:
+    """Keep rows whose value is in the selected list for every filter.
+    A filter that is missing or None means 'all values'."""
+    mask = pd.Series(True, index=model.index)
+    for label, chosen in selections.items():
+        if chosen is None:
+            continue
+        mask &= model[FILTER_COLUMNS[label]].isin(chosen)
+    return model[mask]
+
+
+def revenue_by(model: pd.DataFrame, *cols: str) -> pd.DataFrame:
+    """Revenue summed by one or more columns, as a tidy table."""
+    rev = pd.to_numeric(model[REVENUE_COL], errors='coerce')
+    work = model.assign(**{REVENUE_COL: rev}).dropna(subset=list(cols))
+    return work.groupby(list(cols), as_index=False)[REVENUE_COL].sum()
+
+
+def kpis(model: pd.DataFrame) -> dict:
+    """Headline numbers for whatever rows are currently selected."""
+    rev = pd.to_numeric(model[REVENUE_COL], errors='coerce')
+    by_year = revenue_by(model, 'Year').sort_values('Year')
+    growth = None
+    if len(by_year) >= 2 and by_year[REVENUE_COL].iloc[0] > 0:
+        first, last = by_year.iloc[0], by_year.iloc[-1]
+        growth = {'from': int(first['Year']), 'to': int(last['Year']),
+                  'pct': float((last[REVENUE_COL] / first[REVENUE_COL] - 1) * 100)}
+    web = float(rev[model['Channel'] == 'Website'].sum())
+    total = float(rev.sum())
+    return {
+        'total': total,
+        'rows': int(rev.notna().sum()),
+        'website_share_pct': (web / total * 100) if total else None,
+        'growth': growth,
+    }

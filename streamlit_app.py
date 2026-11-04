@@ -2,6 +2,7 @@
 reconcile total revenue with Power BI.
 Keep calculations in analytics.py and the assistant in agent.py."""
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 import agent
@@ -112,23 +113,95 @@ with tab_model:
                 'not joined to the sales rows. It links to Sales through `StoreYear` = `Survey ID` '
                 'and will be compared at the store-year level.')
 
-# ---------------------------------------------------------------- 3. revenue
+# ---------------------------------------------------------------- 3. dashboard
+MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+CHANNEL_COLORS = {'Website': '#2a6fdb', 'Brick & Mortar': '#d9822b', 'Unknown': '#9aa0a6'}
+
+
+def money(x):
+    return f'${x:,.0f}'
+
+
 with tab_dash:
-    st.subheader('Step 3: reconcile with Power BI')
-    k1, k2, k3 = st.columns(3)
-    k1.metric('Total revenue (all years, all stores)', f"${recon['total']:,.2f}")
-    k2.metric('Sales rows used', f"{recon['rows'] - recon['blank_revenue_rows']:,}")
-    years = recon['by_year'].index
-    k3.metric('Period covered', f'{years.min()}–{years.max()}' if len(years) else 'n/a')
-    if recon['blank_revenue_rows']:
-        st.warning(f"{recon['blank_revenue_rows']} row(s) have blank or non-numeric revenue "
-                   'and are excluded from the total.')
-    left, right = st.columns(2)
-    left.markdown('**Revenue by channel**')
-    left.dataframe(recon['by_channel'].map('${:,.2f}'.format).rename('Revenue'))
-    right.markdown('**Revenue by year**')
-    right.dataframe(recon['by_year'].map('${:,.2f}'.format).rename('Revenue'))
-    st.info('Next (build step 4): filters and at least three charts go here.')
+    # Filters: options come from the loaded data. An empty box means "all".
+    options = analytics.filter_options(model)
+    st.subheader('Filters')
+    st.caption('Leave a filter empty to include everything. Every number and chart below uses these filters.')
+    f1, f2, f3, f4 = st.columns(4)
+    chosen = {
+        'Year': f1.multiselect('Year', options['Year'], key='f_year'),
+        'Channel': f2.multiselect('Sales channel', options['Channel'], key='f_channel'),
+        'Category': f3.multiselect('Product category', options['Category'], key='f_category'),
+        'Store': f4.multiselect('Store', options['Store'], key='f_store'),
+    }
+    selections = {k: (v if v else None) for k, v in chosen.items()}
+    view = analytics.filter_model(model, selections)
+    scope = '; '.join(f'{k}: {", ".join(map(str, v))}' for k, v in selections.items() if v) \
+        or 'all years, all stores, all categories, both channels'
+    st.markdown(f'**Scope:** {scope}')
+
+    if view.empty:
+        st.warning('No sales match these filters. Clear one or more filters.')
+    else:
+        k = analytics.kpis(view)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric('Total revenue', money(k['total']))
+        c2.metric('Website share of revenue',
+                  f"{k['website_share_pct']:.1f}%" if k['website_share_pct'] is not None else 'n/a')
+        if k['growth']:
+            g = k['growth']
+            c3.metric(f"Revenue growth {g['from']}→{g['to']}", f"{g['pct']:+.1f}%")
+        else:
+            c3.metric('Revenue growth', 'needs 2+ years')
+        c4.metric('Sales rows (product-store-months)', f"{k['rows']:,}")
+
+        # Chart 1: revenue by year, split by channel
+        by_year = analytics.revenue_by(view, 'Year', 'Channel')
+        by_year['Year'] = by_year['Year'].astype(str)
+        fig1 = px.bar(by_year, x='Year', y='Revenue', color='Channel', barmode='group',
+                      color_discrete_map=CHANNEL_COLORS,
+                      title='Revenue by year and sales channel',
+                      labels={'Revenue': 'Revenue ($)', 'Year': 'Year'})
+        fig1.update_layout(yaxis_tickprefix='$', yaxis_tickformat=',.0f')
+        st.plotly_chart(fig1, use_container_width=True)
+
+        left, right = st.columns(2)
+        # Chart 2: monthly pattern, one line per year
+        by_month = analytics.revenue_by(view, 'Year', 'Month').sort_values(['Year', 'Month'])
+        by_month['Month name'] = by_month['Month'].map(lambda m: MONTHS[int(m) - 1])
+        by_month['Year'] = by_month['Year'].astype(str)
+        fig2 = px.line(by_month, x='Month name', y='Revenue', color='Year', markers=True,
+                       category_orders={'Month name': MONTHS},
+                       title='Monthly revenue pattern (one line per year)',
+                       labels={'Revenue': 'Revenue ($)', 'Month name': 'Month'})
+        fig2.update_layout(yaxis_tickprefix='$', yaxis_tickformat=',.0f')
+        left.plotly_chart(fig2, use_container_width=True)
+
+        # Chart 3: revenue by category
+        by_cat = analytics.revenue_by(view, 'Category').sort_values('Revenue')
+        fig3 = px.bar(by_cat, x='Revenue', y='Category', orientation='h',
+                      title='Revenue by product category',
+                      labels={'Revenue': 'Revenue ($)', 'Category': ''})
+        fig3.update_layout(xaxis_tickprefix='$', xaxis_tickformat=',.0f')
+        right.plotly_chart(fig3, use_container_width=True)
+
+        # Chart 4: revenue by store
+        by_store = analytics.revenue_by(view, 'Store', 'Channel').sort_values('Revenue')
+        fig4 = px.bar(by_store, x='Revenue', y='Store', color='Channel', orientation='h',
+                      color_discrete_map=CHANNEL_COLORS,
+                      title='Revenue by store (SH00 is the website)',
+                      labels={'Revenue': 'Revenue ($)', 'Store': ''},
+                      height=max(350, 28 * len(by_store)))
+        fig4.update_layout(xaxis_tickprefix='$', xaxis_tickformat=',.0f')
+        st.plotly_chart(fig4, use_container_width=True)
+
+        with st.expander('Reconciliation figures for Power BI (unfiltered)'):
+            a, b = st.columns(2)
+            a.markdown('**Revenue by channel**')
+            a.dataframe(recon['by_channel'].map('${:,.2f}'.format).rename('Revenue'))
+            b.markdown('**Revenue by year**')
+            b.dataframe(recon['by_year'].map('${:,.2f}'.format).rename('Revenue'))
+            st.metric('Total revenue, all data', f"${recon['total']:,.2f}")
 
 # ---------------------------------------------------------------- assistant
 with tab_assistant:
