@@ -16,15 +16,29 @@ def excel_sheet_names(file_bytes: bytes) -> list[str]:
     return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
 
 
-def load_table(file_bytes: bytes, filename: str, sheet_name=0) -> pd.DataFrame:
-    """Read an uploaded CSV / TXT / TSV / Excel file into a DataFrame."""
+def load_table(file_bytes: bytes, filename: str, sheet_name=0, header_hint: str | None = None) -> pd.DataFrame:
+    """Read an uploaded CSV / TXT / TSV / Excel file into a DataFrame.
+
+    header_hint: the name of a column we expect. Some sheets (the Survey workbook)
+    have title rows above the real header, so we look for the row that contains
+    this column name and use it as the header."""
     name = filename.lower()
     buffer = io.BytesIO(file_bytes)
     if name.endswith(EXCEL_EXT):
-        return pd.read_excel(buffer, sheet_name=sheet_name)
-    if name.endswith(TEXT_EXT):
-        return pd.read_csv(buffer, sep=None, engine='python')  # sniffs the delimiter
-    raise ValueError(f'Unsupported file type: {filename}')
+        header_row = 0
+        if header_hint:
+            peek = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, nrows=15)
+            for i, row in peek.iterrows():
+                if header_hint in [str(v).strip() for v in row.values]:
+                    header_row = i
+                    break
+        df = pd.read_excel(buffer, sheet_name=sheet_name, header=header_row)
+    elif name.endswith(TEXT_EXT):
+        df = pd.read_csv(buffer, sep=None, engine='python')  # sniffs the delimiter
+    else:
+        raise ValueError(f'Unsupported file type: {filename}')
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.dropna(how='all')  # drop fully blank rows (e.g. trailing lines in Excel)
 
 
 def profile_table(df: pd.DataFrame) -> dict:
@@ -156,3 +170,183 @@ def check_merge(left: pd.DataFrame, right: pd.DataFrame, on, value_col: str, how
                     'of both tables before using this result.') if fan_out else '',
     }
     return merged, report
+
+
+# ======================================================= E-PRESSO DATA MODEL
+# What each uploaded table must contain. Names match the exported source files.
+# If an updated file is missing one of these columns, the app names it instead
+# of crashing.
+TABLE_SPECS = {
+    'Sales': {
+        'source': 'Sales table in Support_EX_B_Sales.accdb (exported to CSV/Excel)',
+        'required': ['Sales ID', 'Date', 'Store ID', 'StoreYear', 'Category ID', 'Product ID', 'Revenue'],
+        'key': ['Sales ID'],
+        'grain': 'one product at one store (or the website) in one month',
+        'has_revenue': True,
+    },
+    'Stores': {
+        'source': 'Support_EX_B_Stores.csv',
+        'required': ['ID', 'City', 'State', 'StoreType', 'Market', 'Location', 'Manager'],
+        'key': ['ID'],
+        'grain': 'one store (SH00 is the website)',
+        'has_revenue': False,
+    },
+    'Products': {
+        'source': 'Products table in Support_EX_B_Sales.accdb',
+        'required': ['Product ID', 'Product'],
+        'key': ['Product ID'],
+        'grain': 'one product',
+        'has_revenue': False,
+    },
+    'Categories': {
+        'source': 'Categories table in Support_EX_B_Sales.accdb',
+        'required': ['Category ID', 'Category'],
+        'key': ['Category ID'],
+        'grain': 'one product category',
+        'has_revenue': False,
+    },
+    'Survey': {
+        'source': 'Support_EX_B_Survey.xlsx, sheet "Survey Results"',
+        'required': ['Survey ID', 'Store ID', 'Year', 'Satisfaction', 'Interest'],
+        'key': ['Survey ID'],
+        'grain': 'one store in one year (Survey ID = StoreID_YY)',
+        'has_revenue': False,
+    },
+}
+REVENUE_COL = 'Revenue'
+
+
+def missing_columns(df: pd.DataFrame, table: str) -> list[str]:
+    """Required columns that are not in the uploaded table."""
+    return [c for c in TABLE_SPECS[table]['required'] if c not in df.columns]
+
+
+def clean_sales(sales: pd.DataFrame) -> pd.DataFrame:
+    """Give Sales proper types. Bad dates/revenue become blank (NaN) and are
+    reported by the data-quality check rather than silently dropped."""
+    out = sales.copy()
+    out['Date'] = pd.to_datetime(out['Date'], errors='coerce')
+    out[REVENUE_COL] = pd.to_numeric(out[REVENUE_COL], errors='coerce')
+    for c in ('Sales ID', 'Store ID', 'StoreYear', 'Category ID', 'Product ID'):
+        out[c] = out[c].astype('string').str.strip()
+    out['Year'] = out['Date'].dt.year.astype('Int64')
+    out['Month'] = out['Date'].dt.month.astype('Int64')
+    return out
+
+
+def key_report(df: pd.DataFrame, table: str) -> dict:
+    """Is the key column really unique and filled in? (Checks the grain.)"""
+    key = TABLE_SPECS[table]['key']
+    present = [k for k in key if k in df.columns]
+    if not present:
+        return {'key': key, 'blank_keys': None, 'duplicate_keys': None}
+    return {
+        'key': key,
+        'blank_keys': int(df[present].isna().any(axis=1).sum()),
+        'duplicate_keys': int(df.dropna(subset=present).duplicated(subset=present).sum()),
+    }
+
+
+def grain_table(tables: dict) -> pd.DataFrame:
+    """The grain-statement table from the Project Guide, with live row counts."""
+    rows = []
+    for name, spec in TABLE_SPECS.items():
+        df = tables.get(name)
+        rows.append({
+            'Table': name,
+            'Source file / sheet': spec['source'],
+            'One row =': spec['grain'],
+            'Key column(s)': ', '.join(spec['key']),
+            'Row count': len(df) if df is not None else None,
+            'Contains revenue?': 'Yes' if spec['has_revenue'] else 'No',
+        })
+    return pd.DataFrame(rows)
+
+
+def build_sales_model(tables: dict):
+    """Join the lookup tables onto Sales, one at a time, checking each join.
+
+    Sales is the 'many' side. Stores, Products and Categories are 'one' sides
+    (one row per key), so a correct left join keeps the row count and the
+    revenue total unchanged. The Survey is at a different grain (store-year),
+    so it is NOT joined here; it is only used for store-year comparisons.
+    Returns (model, merge_checks)."""
+    sales = clean_sales(tables['Sales'])
+    checks = []
+
+    stores = tables['Stores'].rename(columns={'ID': 'Store ID'}).copy()
+    stores['Store ID'] = stores['Store ID'].astype('string').str.strip()
+    stores = stores.drop_duplicates(subset=['Store ID'])
+    stores['Channel'] = stores['StoreType'].where(stores['StoreType'].notna(), 'Unknown')
+
+    joins = [
+        ('Sales + Stores', stores[['Store ID', 'City', 'State', 'StoreType', 'Channel',
+                                   'Market', 'Location', 'Manager']], 'Store ID'),
+        ('+ Products', tables['Products'][['Product ID', 'Product']], 'Product ID'),
+        ('+ Categories', tables['Categories'][['Category ID', 'Category']], 'Category ID'),
+    ]
+    model = sales
+    for label, right, key in joins:
+        right = right.copy()
+        right[key] = right[key].astype('string').str.strip()
+        right = right.drop_duplicates(subset=[key])   # protect against fan-out
+        unmatched = int((~model[key].isin(right[key])).sum())
+        model, rep = check_merge(model, right, on=key, value_col=REVENUE_COL, how='left')
+        checks.append({
+            'Merge': label, 'Join key': key,
+            'Rows before': rep['rows_before'], 'Rows after': rep['rows_after'],
+            'Revenue sum before': rep['sum_before'], 'Revenue sum after': rep['sum_after'],
+            'Sales rows with no match': unmatched,
+            'Explanation': ('OK: many-to-one join, no rows or revenue added or lost.'
+                            if not rep['changed'] else rep['warning']),
+        })
+    model['Channel'] = model['Channel'].fillna('Unknown')
+    return model, pd.DataFrame(checks)
+
+
+def total_revenue(model: pd.DataFrame) -> float:
+    """Total revenue = sum of the Revenue column over every sales row loaded."""
+    return float(pd.to_numeric(model[REVENUE_COL], errors='coerce').sum())
+
+
+def reconciliation_summary(model: pd.DataFrame) -> dict:
+    """Numbers to compare against Power BI before building anything else."""
+    rev = pd.to_numeric(model[REVENUE_COL], errors='coerce')
+    work = model.assign(**{REVENUE_COL: rev})
+    return {
+        'total': float(rev.sum()),
+        'by_channel': work.groupby('Channel')[REVENUE_COL].sum(),
+        'by_year': work.dropna(subset=['Year']).groupby('Year')[REVENUE_COL].sum(),
+        'rows': len(model),
+        'blank_revenue_rows': int(rev.isna().sum()),
+    }
+
+
+def sales_quality_issues(sales: pd.DataFrame, tables: dict) -> pd.DataFrame:
+    """Problems specific to the E-Presso Sales table, in plain language."""
+    s = clean_sales(sales)
+    issues = []
+
+    def add(check, n, note):
+        issues.append({'Check': check, 'Rows affected': int(n), 'Note': note})
+
+    add('Blank or non-numeric Revenue', s[REVENUE_COL].isna().sum(),
+        'Excluded from revenue totals.')
+    add('Negative or zero Revenue', (s[REVENUE_COL] <= 0).sum(), 'Worth checking; may be returns or errors.')
+    add('Blank or invalid Date', s['Date'].isna().sum(), 'Excluded from year/month charts.')
+    add('Duplicate Sales ID', s['Sales ID'].dropna().duplicated().sum(), 'Would double-count revenue.')
+    stores = tables.get('Stores')
+    if stores is not None and 'ID' in stores.columns:
+        known = set(stores['ID'].astype(str).str.strip())
+        add('Store ID not in Stores table', (~s['Store ID'].isin(known)).sum(),
+            'Revenue counted, but store/channel shown as Unknown.')
+    for tbl, key in (('Products', 'Product ID'), ('Categories', 'Category ID')):
+        lk = tables.get(tbl)
+        if lk is not None and key in lk.columns:
+            known = set(lk[key].astype(str).str.strip())
+            add(f'{key} not in {tbl} table', (~s[key].isin(known)).sum(),
+                'Revenue counted, but name shown as blank.')
+    bad_sy = s['StoreYear'] != (s['Store ID'] + '_' + (s['Year'] % 100).astype('string').str.zfill(2))
+    add('StoreYear does not match Store ID + year', bad_sy.fillna(True).sum(),
+        'StoreYear links Sales to the Survey; a mismatch breaks that link.')
+    return pd.DataFrame(issues)
