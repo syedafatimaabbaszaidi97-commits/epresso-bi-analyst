@@ -11,7 +11,7 @@ import analytics
 MAX_QUESTIONS = 15  # per-session limit for the assistant
 
 st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
-st.title('E-Presso BI Analyst-Fatima-Aon-Nellie')
+st.title('E-Presso BI Analyst-Fatima-Aon')
 st.caption('Upload the five E-Presso tables in the sidebar. Every number on this page is '
            'calculated from the files you upload; nothing is typed into the code.')
 
