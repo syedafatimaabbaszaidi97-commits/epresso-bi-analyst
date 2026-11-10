@@ -205,25 +205,38 @@ with tab_dash:
 
 # ---------------------------------------------------------------- assistant
 with tab_assistant:
-    st.caption('Mode: rules-based starter. Describe what you actually built here.')
+    st.subheader('Ask the analytical assistant')
+    st.caption('Mode: **rules-based assistant (Option B)**. It matches your question to one of six '
+               'approved functions, runs it on the uploaded data, and shows the call it made. '
+               'It answers on the full dataset; the dashboard filters do not apply here.')
+    with st.expander('What can I ask?'):
+        st.markdown('\n'.join(f'- {x}' for x in agent.CAN_ANSWER))
+        st.markdown('Examples: *How much revenue did the website generate in 2028?* · '
+                    '*Which store had the greatest percentage revenue decline?* · '
+                    '*Which month is busiest?* · *Does customer satisfaction cause higher revenue?*')
     st.session_state.setdefault('n_questions', 0)
     st.session_state.setdefault('history', [])
+    st.caption(f"Questions used this session: {st.session_state['n_questions']} of {MAX_QUESTIONS}")
     for item in st.session_state['history']:
         with st.chat_message('user'):
             st.write(item['question'])
         with st.chat_message('assistant'):
-            st.markdown(f"**Scope:** {item['answer']['scope']}")
-            st.markdown(f"**Findings:** {item['answer']['findings']}")
-            if item['answer']['interpretation']:
-                st.markdown(f"**Interpretation:** {item['answer']['interpretation']}")
-            with st.expander('Tool-call log'):
-                st.json(item['answer']['tool_log'])
+            a = item['answer']
+            st.markdown(f"**Scope:** {a['scope']}")
+            st.markdown(f"**Findings:** {a['findings']}")
+            if a['interpretation']:
+                st.markdown(f"**Interpretation:** {a['interpretation']}")
+            if a['next_steps']:
+                st.markdown(f"**Next steps:** {a['next_steps']}")
+            with st.expander('Tool-call log (function, arguments, raw result)'):
+                st.json(a['tool_log'])
     question = st.chat_input('Ask a question about the loaded data')
     if question:
         if st.session_state['n_questions'] >= MAX_QUESTIONS:
-            st.warning('Question limit reached for this session. Reload the page to start over.')
+            st.warning(f'Question limit ({MAX_QUESTIONS}) reached for this session. '
+                       'Reload the page to start over.')
         else:
             st.session_state['n_questions'] += 1
-            answer = agent.answer_question(question, model, mode='rules')
+            answer = agent.answer_question(question, {'model': model, 'tables': tables}, mode='rules')
             st.session_state['history'].append({'question': question, 'answer': answer})
             st.rerun()

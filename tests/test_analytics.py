@@ -55,12 +55,15 @@ def test_merge_fan_out_is_detected(df):
     assert rep['changed'] and rep['sum_after'] > rep['sum_before']
 
 
+# The two assistant tests below were updated for our own tools (see tests/test_agent.py).
 def test_dispatcher_rejects_unknown_tool_and_arguments(df):
     log = []
-    assert agent.run_tool('run_python', {}, df, log).error
-    assert agent.run_tool('get_total', {'value_col': 'amount', 'code': 'x'}, df, log).error
+    data = {'model': df, 'tables': {}}
+    assert agent.run_tool('run_python', {}, data, log).error
+    assert agent.run_tool('get_total_revenue', {'code': 'x'}, data, log).error
 
 
 def test_unsupported_question(df):
-    out = agent.answer_question('What is the meaning of life?', df)
-    assert 'cannot answer' in out['findings']
+    out = agent.answer_question('What is the meaning of life?', {'model': df.assign(
+        Category='x', Store='A', City='a', **{'Store ID': 'A'}), 'tables': {}})
+    assert 'can only answer' in out['findings'] and out['tool_log'] == []
