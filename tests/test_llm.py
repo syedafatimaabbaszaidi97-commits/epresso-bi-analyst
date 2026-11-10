@@ -103,3 +103,43 @@ def test_model_cannot_pass_unknown_arguments(monkeypatch, data):
     fake_gemini(monkeypatch, lambda name: ('get_total_revenue', {'sql': 'DROP TABLE sales'}))
     out = agent.answer_question_llm('Total?', data, client=None)
     assert 'could not be completed' in out['findings']
+
+
+def test_busy_model_is_retried_once(monkeypatch, data):
+    monkeypatch.setattr(agent, 'RETRY_WAIT_SECONDS', 0)
+    calls = []
+
+    def choose(name):
+        calls.append(name)
+        if len(calls) == 1:
+            raise RuntimeError('503 UNAVAILABLE. This model is currently experiencing high demand.')
+        return ('get_total_revenue', {})
+    fake_gemini(monkeypatch, choose)
+    out = agent.answer_question_llm('Total revenue?', data, client=None, model_names=['m1', 'm2'])
+    assert calls == ['m1', 'm1'] and out['answered_by'] == 'Gemini (m1)'
+
+
+def test_busy_explainer_moves_to_next_model(monkeypatch, data):
+    # The real failure we saw: tool chosen fine, explanation hit 503 twice.
+    monkeypatch.setattr(agent, 'RETRY_WAIT_SECONDS', 0)
+    monkeypatch.setattr(agent, '_gemini_choose_tool', lambda c, n, q, s: ('get_total_revenue', {}))
+
+    def explain(client, name, q, result):
+        if name == 'm1':
+            raise RuntimeError('503 UNAVAILABLE. high demand')
+        return {'interpretation': 'Total revenue is $1,500.', 'next_steps': 'Check by year.'}
+    monkeypatch.setattr(agent, '_gemini_explain', explain)
+    out = agent.answer_question_llm('Total revenue?', data, client=None, model_names=['m1', 'm2'])
+    assert out['answered_by'] == 'Gemini (m1) (explanation by m2)'
+    assert 'Total revenue is $1,500.' in out['interpretation']
+
+
+def test_bad_key_is_not_retried(monkeypatch, data):
+    calls = []
+
+    def choose(name):
+        calls.append(name)
+        raise RuntimeError('400 INVALID_ARGUMENT. API key not valid.')
+    fake_gemini(monkeypatch, choose)
+    out = agent.answer_question_llm('Total revenue?', data, client=None, model_names=['m1', 'm2'])
+    assert calls == ['m1'] and out['answered_by'].startswith('Rules-based')

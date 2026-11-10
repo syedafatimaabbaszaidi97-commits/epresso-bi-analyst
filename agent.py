@@ -345,7 +345,7 @@ def answer_question(question: str, data, mode: str = 'rules') -> dict:
 # exist in the loaded data, and (2) explains the tool result. Our code runs the
 # tool. Findings are written by our code from the result; the model writes only
 # Interpretation and Next steps, and any number it uses must appear in the result.
-DEFAULT_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash']
+DEFAULT_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3-flash-preview', 'gemini-flash-latest']
 
 
 def tool_schemas(model) -> list[dict]:
@@ -424,7 +424,9 @@ def _gemini_explain(client, model_name: str, question: str, result: dict) -> dic
                                          response_mime_type='application/json', temperature=0.2)
     prompt = f'Question: {question}\n\nFunction result (JSON):\n{json.dumps(result, default=str)}'
     resp = client.models.generate_content(model=model_name, contents=prompt, config=config)
-    data = json.loads(resp.text)
+    text = (resp.text or '').strip()
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text)  # some models wrap JSON in a code fence
+    data = json.loads(text)
     return {'interpretation': str(data.get('interpretation', '')).strip(),
             'next_steps': str(data.get('next_steps', '')).strip()}
 
@@ -475,36 +477,67 @@ def _limitation(question: str):
     return None
 
 
+RETRY_WAIT_SECONDS = 2  # pause before retrying a busy model
+
+
+def _retryable(exc) -> bool:
+    """Errors worth trying again or trying another model for: model missing (404),
+    server busy (503/500), or that model's free quota used up (429)."""
+    t = str(exc).lower()
+    return any(k in t for k in ('404', 'not found', '503', 'unavailable', 'overloaded',
+                                'high demand', '500', 'internal', '429', 'resource_exhausted', 'quota'))
+
+
+def _call_with_fallback(fn, model_names, log, step):
+    """Run fn(model_name) on each model in turn. A busy model (503) gets one retry
+    after a short pause. Returns (result, model_used) or raises the last error."""
+    import time
+    last = None
+    for name in model_names:
+        for attempt in (1, 2):
+            try:
+                return fn(name), name
+            except Exception as exc:
+                last = exc
+                log.append({'gemini_retry': step, 'model': name, 'attempt': attempt,
+                            'error': f'{type(exc).__name__}: {str(exc)[:120]}'})
+                if not _retryable(exc):
+                    raise
+                busy = any(k in str(exc).lower() for k in ('503', 'unavailable', 'high demand', 'overloaded'))
+                if attempt == 1 and busy:
+                    time.sleep(RETRY_WAIT_SECONDS)
+                    continue
+                break  # missing model, quota, or still busy: try the next model
+    raise last
+
+
 def answer_question_llm(question: str, data: dict, client, model_names=None) -> dict:
     """Option A. Falls back to the rules-based assistant if Gemini is unavailable."""
     model_names = model_names or DEFAULT_MODELS
     schemas = tool_schemas(data['model'])
-    picked, used_model, last_error = None, None, None
-    for name in model_names:
-        try:
-            picked = _gemini_choose_tool(client, name, question, schemas)
-            used_model = name
-            break
-        except Exception as exc:  # 404 = model name not available: try the next one
-            last_error = exc
-            if 'not found' in str(exc).lower() or '404' in str(exc):
-                continue
-            break
+    retries: list = []
+    used_model = None
+    try:
+        picked, used_model = _call_with_fallback(
+            lambda name: _gemini_choose_tool(client, name, question, schemas), model_names, retries, 'choose')
+    except Exception as exc:
+        last_error = exc
     if used_model is None:
         out = answer_question(question, data, mode='rules')
         out['answered_by'] = (f'Rules-based assistant (Gemini unavailable: '
                               f'{type(last_error).__name__}: {str(last_error)[:160]})')
+        out['tool_log'] = retries + out['tool_log']
         return out
 
     if picked is None:
         return {'scope': 'n/a', 'findings': UNSUPPORTED, 'interpretation': '',
                 'next_steps': 'Try asking about revenue, growth, channels, stores, categories or months.',
-                'tool_log': [{'router': f'gemini ({used_model})', 'chosen_tool': None}],
+                'tool_log': retries + [{'router': f'gemini ({used_model})', 'chosen_tool': None}],
                 'answered_by': f'Gemini ({used_model}): no approved function fits this question'}
 
     tool, raw_args = picked
     args = _clean_args(raw_args)
-    log = [{'router': f'gemini ({used_model})', 'chosen_tool': tool, 'raw_arguments': raw_args}]
+    log = retries + [{'router': f'gemini ({used_model})', 'chosen_tool': tool, 'raw_arguments': raw_args}]
     result = run_tool(tool, args, data, log)
     limit = LIMITS.get(_limitation(question))
     findings = format_findings(result)
@@ -517,7 +550,12 @@ def answer_question_llm(question: str, data: dict, client, model_names=None) -> 
 
     note = ''
     try:
-        expl = _gemini_explain(client, used_model, question, result.to_dict())
+        # start with the model that chose the tool, then the others in the list
+        order = [used_model] + [m for m in model_names if m != used_model]
+        expl, explained_by = _call_with_fallback(
+            lambda name: _gemini_explain(client, name, question, result.to_dict()), order, log, 'explain')
+        if explained_by != used_model:
+            note = f' (explanation by {explained_by})'
         bad = unsupported_numbers(expl['interpretation'] + ' ' + expl['next_steps'], result.to_dict())
         if bad:
             log.append({'guard': 'explanation withheld', 'numbers_not_in_tool_result': bad,
