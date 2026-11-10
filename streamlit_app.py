@@ -204,11 +204,31 @@ with tab_dash:
             st.metric('Total revenue, all data', f"${recon['total']:,.2f}")
 
 # ---------------------------------------------------------------- assistant
+@st.cache_resource(show_spinner=False)
+def gemini_client(api_key: str):
+    from google import genai
+    return genai.Client(api_key=api_key)
+
+
+def secret(name: str, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:  # no secrets file at all (e.g. running locally without one)
+        return default
+
+
 with tab_assistant:
     st.subheader('Ask the analytical assistant')
-    st.caption('Mode: **rules-based assistant (Option B)**. It matches your question to one of six '
-               'approved functions, runs it on the uploaded data, and shows the call it made. '
-               'It answers on the full dataset; the dashboard filters do not apply here.')
+    api_key = secret('GEMINI_API_KEY')
+    modes = ['Gemini language model (Option A)', 'Rules-based (Option B)']
+    mode = st.radio('Assistant mode', modes, index=0 if api_key else 1, horizontal=True,
+                    disabled=not api_key, key='assistant_mode')
+    if not api_key:
+        st.caption('No GEMINI_API_KEY in Streamlit Secrets, so the rules-based assistant is used.')
+    st.caption('**Gemini mode:** the model chooses one of six approved functions and explains the '
+               'result; our code runs the function. **Rules-based mode:** keywords choose the function. '
+               'If Gemini fails or its free quota is used up, the rules-based assistant answers instead. '
+               'Answers use the full dataset; the dashboard filters do not apply here.')
     with st.expander('What can I ask?'):
         st.markdown('\n'.join(f'- {x}' for x in agent.CAN_ANSWER))
         st.markdown('Examples: *How much revenue did the website generate in 2028?* · '
@@ -222,6 +242,7 @@ with tab_assistant:
             st.write(item['question'])
         with st.chat_message('assistant'):
             a = item['answer']
+            st.caption(f"Answered by: {a.get('answered_by', 'Rules-based assistant')}")
             st.markdown(f"**Scope:** {a['scope']}")
             st.markdown(f"**Findings:** {a['findings']}")
             if a['interpretation']:
@@ -237,6 +258,19 @@ with tab_assistant:
                        'Reload the page to start over.')
         else:
             st.session_state['n_questions'] += 1
-            answer = agent.answer_question(question, {'model': model, 'tables': tables}, mode='rules')
+            data = {'model': model, 'tables': tables}
+            if mode.startswith('Gemini') and api_key:
+                try:
+                    client = gemini_client(api_key)
+                except Exception as exc:  # e.g. package missing: fall back, don't crash
+                    answer = agent.answer_question(question, data, mode='rules')
+                    answer['answered_by'] = f'Rules-based assistant (Gemini could not start: {exc})'
+                else:
+                    models = [m.strip() for m in str(secret('GEMINI_MODEL', '')).split(',') if m.strip()]
+                    with st.spinner('Asking Gemini...'):
+                        answer = agent.answer_question_llm(question, data, client,
+                                                           models or agent.DEFAULT_MODELS)
+            else:
+                answer = agent.answer_question(question, data, mode='rules')
             st.session_state['history'].append({'question': question, 'answer': answer})
             st.rerun()

@@ -192,9 +192,8 @@ def rules_router(question: str, model):
 
 
 def llm_router(question: str, model):
-    """Option A router. TODO next step: a model with function calling chooses
-    from TOOLS. Must return the same dict shape as rules_router, or None."""
-    raise NotImplementedError('Add the language-model router after the rules-based assistant works.')
+    """Kept for reference: Option A is implemented in answer_question_llm below."""
+    raise NotImplementedError('Use answer_question_llm for the language-model assistant.')
 
 
 # ------------------------------------------------------------------ answer text
@@ -320,7 +319,7 @@ def answer_question(question: str, data, mode: str = 'rules') -> dict:
     if route is None:
         return {'scope': 'n/a', 'findings': UNSUPPORTED, 'interpretation': '',
                 'next_steps': 'Try rephrasing with words like revenue, growth, channel, store, category or month.',
-                'tool_log': log}
+                'tool_log': log, 'answered_by': 'Rules-based assistant'}
     result = run_tool(route['tool'], route['args'], data, log)
     limit = LIMITS.get(route.get('limitation'))
     interp = ' '.join(x for x in [limit[0] if limit else '', _interpretation(result, route)] if x)
@@ -337,4 +336,212 @@ def answer_question(question: str, data, mode: str = 'rules') -> dict:
         'interpretation': ' '.join(x for x in [interp, f'Caveats: {caveats}' if caveats else ''] if x),
         'next_steps': next_steps,
         'tool_log': log,
+        'answered_by': 'Rules-based assistant',
+    }
+
+
+# ================================================================ OPTION A: GEMINI
+# The model (1) chooses ONE tool from TOOLS with arguments limited to values that
+# exist in the loaded data, and (2) explains the tool result. Our code runs the
+# tool. Findings are written by our code from the result; the model writes only
+# Interpretation and Next steps, and any number it uses must appear in the result.
+DEFAULT_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash']
+
+
+def tool_schemas(model) -> list[dict]:
+    """JSON-schema declarations for Gemini. Allowed values come from the loaded data."""
+    years = [str(y) for y in sorted(model['Year'].dropna().unique())]
+    enums = {
+        'year': years, 'start_year': years, 'end_year': years,
+        'channel': sorted(model['Channel'].dropna().astype(str).unique()),
+        'store': sorted(model['Store'].dropna().astype(str).unique()),
+        'category': sorted(model['Category'].dropna().astype(str).unique()),
+    }
+    help_text = {
+        'year': 'Limit to one year.', 'start_year': 'First year of the comparison.',
+        'end_year': 'Last year of the comparison.', 'channel': 'Sales channel.',
+        'store': 'One store. SH00 is the website.', 'category': 'Product category.',
+    }
+    by_values = {'get_revenue_breakdown': ['channel', 'store', 'category', 'year'],
+                 'get_revenue_trend': ['channel', 'store', 'category']}
+    out = []
+    for name, spec in TOOLS.items():
+        props = {}
+        for p in sorted(spec['params']):
+            if p == 'by':
+                props[p] = {'type': 'string', 'enum': by_values[name], 'description': 'What to group by.'}
+            else:
+                props[p] = {'type': 'string', 'enum': enums[p], 'description': help_text[p]}
+        decl = {'name': name, 'description': spec['description']}
+        if props:  # functions with no parameters get no schema at all
+            decl['parameters'] = {'type': 'object', 'properties': props}
+        out.append(decl)
+    return out
+
+
+CHOOSER_PROMPT = SYSTEM_PROMPT + """
+Your only job in this step is to call exactly ONE function that best answers the
+manager's question. Leave out any parameter the question does not specify.
+For questions about profit, call get_revenue_breakdown (by store) so revenue can be shown.
+For questions about causes or whether to close/open a store, call the most relevant
+revenue function; the limitation will be explained afterwards.
+If no function is relevant, do not call any function and reply with one short sentence."""
+
+EXPLAIN_PROMPT = SYSTEM_PROMPT + """
+You receive a manager's question and the JSON result of the function that was run.
+The Findings are already shown to the manager. Write ONLY:
+- "interpretation": 2-4 sentences on what the result means, its limits and caveats.
+- "next_steps": 1-3 sentences on what to check next, or exactly
+  "No recommendation is supported by this data." when a decision is asked for.
+Use only numbers that appear in the result. Do not mention profit as if known.
+Return JSON: {"interpretation": "...", "next_steps": "..."}"""
+
+
+def _gemini_choose_tool(client, model_name: str, question: str, schemas: list[dict]):
+    """Call 1: the model picks a function. Returns (name, args) or None."""
+    from google.genai import types
+    decls = [types.FunctionDeclaration(name=s['name'], description=s['description'],
+                                       parameters_json_schema=s.get('parameters')) for s in schemas]
+    config = types.GenerateContentConfig(
+        system_instruction=CHOOSER_PROMPT,
+        tools=[types.Tool(function_declarations=decls)],
+        tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode='AUTO')),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),  # WE run tools
+        temperature=0,
+    )
+    resp = client.models.generate_content(model=model_name, contents=question, config=config)
+    calls = resp.function_calls or []
+    if not calls:
+        return None
+    return calls[0].name, dict(calls[0].args or {})
+
+
+def _gemini_explain(client, model_name: str, question: str, result: dict) -> dict:
+    """Call 2: the model explains the tool result. Returns {'interpretation', 'next_steps'}."""
+    import json
+    from google.genai import types
+    config = types.GenerateContentConfig(system_instruction=EXPLAIN_PROMPT,
+                                         response_mime_type='application/json', temperature=0.2)
+    prompt = f'Question: {question}\n\nFunction result (JSON):\n{json.dumps(result, default=str)}'
+    resp = client.models.generate_content(model=model_name, contents=prompt, config=config)
+    data = json.loads(resp.text)
+    return {'interpretation': str(data.get('interpretation', '')).strip(),
+            'next_steps': str(data.get('next_steps', '')).strip()}
+
+
+def _clean_args(args: dict) -> dict:
+    """Years arrive as strings (schema enums are strings); convert them back."""
+    out = {}
+    for k, v in args.items():
+        if v in (None, '', 'All'):
+            continue
+        out[k] = int(v) if k in ('year', 'start_year', 'end_year') and str(v).isdigit() else v
+    return out
+
+
+def _numbers(text: str) -> list[float]:
+    found = re.findall(r'-?\d[\d,]*\.?\d*', text or '')
+    return [float(n.replace(',', '')) for n in found if n.replace(',', '').replace('.', '').strip('-')]
+
+
+def unsupported_numbers(text: str, result: dict) -> list[float]:
+    """Numbers in the model's text that cannot be traced to the tool result.
+    Allowed: values in the result (rounded to 0-2 decimals, or in millions/thousands),
+    years, and small counts (<= 12)."""
+    import json
+    allowed = set()
+    for x in _numbers(json.dumps(result, default=str)):
+        for v in (x, abs(x)):
+            for scale in (1, 1e3, 1e6):
+                for d in (0, 1, 2):
+                    allowed.add(round(v / scale, d))
+    bad = []
+    for n in _numbers(text):
+        if abs(n) <= 12 or 2000 <= n <= 2100:
+            continue
+        if not any(round(abs(n), d) in allowed for d in (0, 1, 2)):
+            bad.append(n)
+    return bad
+
+
+def _limitation(question: str):
+    q = question.lower()
+    if re.search(r'profit|margin|cost|expense|net income', q):
+        return 'profit'
+    if re.search(r'\bclose\b|shut|should (we|e-presso)|invest|open a new|recommend', q):
+        return 'judgment'
+    if re.search(r'caus|why did|why is|because|lead to|drive', q):
+        return 'causation'
+    return None
+
+
+def answer_question_llm(question: str, data: dict, client, model_names=None) -> dict:
+    """Option A. Falls back to the rules-based assistant if Gemini is unavailable."""
+    model_names = model_names or DEFAULT_MODELS
+    schemas = tool_schemas(data['model'])
+    picked, used_model, last_error = None, None, None
+    for name in model_names:
+        try:
+            picked = _gemini_choose_tool(client, name, question, schemas)
+            used_model = name
+            break
+        except Exception as exc:  # 404 = model name not available: try the next one
+            last_error = exc
+            if 'not found' in str(exc).lower() or '404' in str(exc):
+                continue
+            break
+    if used_model is None:
+        out = answer_question(question, data, mode='rules')
+        out['answered_by'] = (f'Rules-based assistant (Gemini unavailable: '
+                              f'{type(last_error).__name__}: {str(last_error)[:160]})')
+        return out
+
+    if picked is None:
+        return {'scope': 'n/a', 'findings': UNSUPPORTED, 'interpretation': '',
+                'next_steps': 'Try asking about revenue, growth, channels, stores, categories or months.',
+                'tool_log': [{'router': f'gemini ({used_model})', 'chosen_tool': None}],
+                'answered_by': f'Gemini ({used_model}): no approved function fits this question'}
+
+    tool, raw_args = picked
+    args = _clean_args(raw_args)
+    log = [{'router': f'gemini ({used_model})', 'chosen_tool': tool, 'raw_arguments': raw_args}]
+    result = run_tool(tool, args, data, log)
+    limit = LIMITS.get(_limitation(question))
+    findings = format_findings(result)
+    caveats = ' '.join(result.caveats)
+
+    if result.error:
+        return {'scope': _scope_text(result.scope), 'findings': findings, 'interpretation': '',
+                'next_steps': 'Ask again using one of the valid values listed above.',
+                'tool_log': log, 'answered_by': f'Gemini ({used_model})'}
+
+    note = ''
+    try:
+        expl = _gemini_explain(client, used_model, question, result.to_dict())
+        bad = unsupported_numbers(expl['interpretation'] + ' ' + expl['next_steps'], result.to_dict())
+        if bad:
+            log.append({'guard': 'explanation withheld', 'numbers_not_in_tool_result': bad,
+                        'model_text': expl})
+            note = ' (model explanation withheld: it used numbers not in the tool result)'
+            expl = None
+    except Exception as exc:
+        log.append({'guard': 'explanation failed', 'error': f'{type(exc).__name__}: {str(exc)[:160]}'})
+        note = ' (model explanation unavailable; standard explanation shown)'
+        expl = None
+
+    if expl:
+        interp = ' '.join(x for x in [limit[0] if limit else '', expl['interpretation']] if x)
+        next_steps = expl['next_steps'] or (limit[1] if limit else '')
+        if limit and limit[1] not in next_steps:
+            next_steps = (next_steps + ' ' + limit[1]).strip()
+    else:
+        interp = ' '.join(x for x in [limit[0] if limit else '', _interpretation(result, {})] if x)
+        next_steps = limit[1] if limit else 'No recommendation is supported by this data alone; this is a descriptive figure.'
+    return {
+        'scope': _scope_text(result.scope),
+        'findings': findings,
+        'interpretation': ' '.join(x for x in [interp, f'Caveats: {caveats}' if caveats else ''] if x),
+        'next_steps': next_steps,
+        'tool_log': log,
+        'answered_by': f'Gemini ({used_model}){note}',
     }
