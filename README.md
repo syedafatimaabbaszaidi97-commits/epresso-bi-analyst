@@ -1,6 +1,6 @@
 # E-Presso BI Analyst
 
-Team: Fatima, Aon, Nellie
+Team: Fatima, Aon 
 
 ## What this application does
 This app lets an E-Presso manager explore five years of sales (2025–2029) across the website and 20 physical stores. After the five E-Presso data files are uploaded, it checks them for problems, joins them safely, and shows total revenue, website share, growth, and four charts that respond to year, channel, category and store filters. A built-in assistant answers business questions in plain English, such as "Which store declined the most?". Every number it gives comes from one of six tested calculations run on the uploaded data, and it says plainly when the data cannot answer a question, such as anything about profit. Every figure is recalculated from whatever files are uploaded, so an updated dataset works without any code change.
