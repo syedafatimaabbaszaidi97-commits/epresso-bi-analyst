@@ -11,53 +11,48 @@ import analytics
 MAX_QUESTIONS = 15  # per-session limit for the assistant
 
 st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
-st.title('E-Presso BI Analyst-Fatima-Aon')
+st.title('E-Presso BI Analyst-Fatima-Aon-Nellie')
 st.caption('Upload the five E-Presso tables in the sidebar. Every number on this page is '
            'calculated from the files you upload; nothing is typed into the code.')
 
 
 @st.cache_data(show_spinner=False)
-def cached_load(file_bytes: bytes, filename: str, sheet_name, header_hint):
+def cached_read(file_bytes: bytes, filename: str):
     # The cache is keyed on the file CONTENTS, so a modified file is never
     # confused with the original one.
-    return analytics.load_table(file_bytes, filename, sheet_name, header_hint)
+    return analytics.read_candidates(file_bytes, filename)
 
 
-# Which column tells us we found the header row (the Survey sheet has title rows on top)
-HEADER_HINTS = {'Sales': 'Sales ID', 'Stores': 'ID', 'Products': 'Product ID',
-                'Categories': 'Category ID', 'Survey': 'Survey ID'}
-PREFERRED_SHEET = {'Survey': 'Survey Results'}
 FILE_TYPES = ['csv', 'txt', 'tsv', 'xlsx', 'xls']
 
-uploads, sheets = {}, {}
 with st.sidebar:
     st.header('Data')
-    st.caption('One file per table. CSV or Excel.')
-    for table, spec in analytics.TABLE_SPECS.items():
-        f = st.file_uploader(f'{table}  ({spec["source"]})', type=FILE_TYPES, key=f'up_{table}')
-        uploads[table] = f
-        sheets[table] = 0
-        if f is not None and f.name.lower().endswith(analytics.EXCEL_EXT):
-            names = analytics.excel_sheet_names(f.getvalue())
-            default = names.index(PREFERRED_SHEET[table]) if PREFERRED_SHEET.get(table) in names else 0
-            sheets[table] = st.selectbox(f'{table} sheet', names, index=default, key=f'sh_{table}')
+    uploaded = st.file_uploader(
+        'Upload all five E-Presso files at once (CSV or Excel)', type=FILE_TYPES,
+        accept_multiple_files=True, key='uploads')
+    st.caption('Select the five files together (Ctrl/Cmd + click). Each file is recognised by its '
+               'columns, so file names do not matter. To swap one file (e.g. a modified Sales file), '
+               'remove it with ✕ and add the new one.')
 
-missing_files = [t for t, f in uploads.items() if f is None]
-if missing_files:
-    st.info('Upload these tables in the sidebar to begin: ' + ', '.join(missing_files))
+if not uploaded:
+    st.info('Upload the five E-Presso tables in the sidebar to begin: '
+            + ', '.join(analytics.TABLE_SPECS))
     st.stop()
 
-# ---------------------------------------------------------------- load + validate
-tables, problems = {}, []
-for table, f in uploads.items():
+# ---------------------------------------------------------------- load + identify
+read, problems = [], []
+for f in uploaded:
     try:
-        tables[table] = cached_load(f.getvalue(), f.name, sheets[table], HEADER_HINTS[table])
+        read.append((f.name, cached_read(f.getvalue(), f.name)))
     except Exception as exc:  # readable message instead of a traceback
-        problems.append(f'**{table}** ({f.name}): could not read the file ({exc}).')
-        continue
-    gone = analytics.missing_columns(tables[table], table)
-    if gone:
-        problems.append(f'**{table}** ({f.name}) is missing required column(s): {", ".join(gone)}.')
+        problems.append(f'**{f.name}**: could not read the file ({exc}).')
+tables, sources, found_problems = analytics.identify_tables(read)
+problems += found_problems
+
+with st.sidebar:
+    for t in analytics.TABLE_SPECS:
+        st.markdown(f'{"✅" if t in tables else "⬜"} **{t}**' + (f': {sources[t]}' if t in sources else ''))
+
 if problems:
     st.error('Some files cannot be used yet:\n\n' + '\n\n'.join(f'- {p}' for p in problems))
     st.stop()
@@ -150,10 +145,14 @@ with tab_dash:
                   f"{k['website_share_pct']:.1f}%" if k['website_share_pct'] is not None else 'n/a')
         if k['growth']:
             g = k['growth']
-            c3.metric(f"Revenue growth {g['from']}→{g['to']}", f"{g['pct']:+.1f}%")
+            c3.metric(f"Revenue growth {g['from']}→{g['to']} (full years)", f"{g['pct']:+.1f}%")
         else:
-            c3.metric('Revenue growth', 'needs 2+ years')
+            c3.metric('Revenue growth', 'needs 2+ full years')
         c4.metric('Sales rows (product-store-months)', f"{k['rows']:,}")
+
+        if k['partial_years']:
+            st.warning(f"Year(s) {', '.join(map(str, k['partial_years']))} have fewer than 12 months of "
+                       'data in this selection. They are left out of the growth figure; compare them with care.')
 
         # Chart 1: revenue by year, split by channel
         by_year = analytics.revenue_by(view, 'Year', 'Channel')

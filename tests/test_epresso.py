@@ -103,7 +103,63 @@ def test_kpis(model):
     k = analytics.kpis(model)
     assert k['total'] == 1500
     assert round(k['website_share_pct'], 1) == 33.3          # 500 / 1,500
-    assert k['growth'] == {'from': 2025, 'to': 2026, 'pct': 50.0}   # 900 / 600 - 1
+    # The toy table only has Jan/Feb, so neither year is a full year: no growth figure.
+    assert k['growth'] is None and k['partial_years'] == [2025, 2026]
+
+
+def _full_years(tables, rev_2025, rev_2026):
+    """One SH01 row per month for 2025 and 2026, so both years are complete."""
+    rows = []
+    for y, rev in ((2025, rev_2025), (2026, rev_2026)):
+        for m in range(1, 13):
+            rows.append({'Sales ID': f'S{y}{m:02d}', 'Date': f'{y}-{m:02d}-28', 'Store ID': 'SH01',
+                         'StoreYear': f'SH01_{y % 100}', 'Category ID': 'C1', 'Product ID': 'P01',
+                         'Revenue': rev})
+    tables['Sales'] = pd.DataFrame(rows)
+    return tables
+
+
+def test_growth_uses_full_years(tables):
+    # 12 x 100 = 1,200 in 2025; 12 x 150 = 1,800 in 2026 -> +50%
+    m, _ = analytics.build_sales_model(_full_years(tables, 100, 150))
+    assert analytics.kpis(m)['growth'] == {'from': 2025, 'to': 2026, 'pct': 50.0}
+
+
+def test_partial_new_year_is_left_out_of_growth(tables):
+    # Add ONE month of 2027 (revenue 10). Growth must still be 2025 -> 2026 (+50%),
+    # not 1,200 -> 10 (-99%), and 2027 is reported as a partial year.
+    t = _full_years(tables, 100, 150)
+    t['Sales'] = pd.concat([t['Sales'], pd.DataFrame([{
+        'Sales ID': 'S202701', 'Date': '2027-01-31', 'Store ID': 'SH01', 'StoreYear': 'SH01_27',
+        'Category ID': 'C1', 'Product ID': 'P01', 'Revenue': 10}])])
+    m, _ = analytics.build_sales_model(t)
+    k = analytics.kpis(m)
+    assert k['growth'] == {'from': 2025, 'to': 2026, 'pct': 50.0}
+    assert k['partial_years'] == [2027]
+    trend = analytics.get_revenue_trend(m, by='channel')
+    assert trend.scope['from_year'] == 2025 and trend.scope['to_year'] == 2026
+    assert any('Partial year' in c for c in trend.caveats)
+
+
+def test_exact_duplicate_row_is_not_double_counted(tables):
+    # S3 (300) appears twice: total stays 1,500, and the removal is recorded.
+    tables['Sales'] = pd.concat([tables['Sales'], tables['Sales'].iloc[[2]]])
+    m, checks = analytics.build_sales_model(tables)
+    assert analytics.total_revenue(m) == 1500
+    first = checks.iloc[0]
+    assert first['Rows before'] == 6 and first['Rows after'] == 5
+    assert first['Revenue sum before'] == 1800 and first['Revenue sum after'] == 1500
+
+
+def test_same_id_different_values_is_kept_and_flagged(tables):
+    # A second S3 with a different revenue (999) is not an exact copy: we cannot
+    # tell which is right, so it is kept and the duplicate ID is reported.
+    extra = tables['Sales'].iloc[[2]].assign(Revenue=999)
+    tables['Sales'] = pd.concat([tables['Sales'], extra])
+    m, _ = analytics.build_sales_model(tables)
+    assert analytics.total_revenue(m) == 2499
+    issues = analytics.sales_quality_issues(tables['Sales'], tables).set_index('Check')
+    assert issues.loc['Duplicate Sales ID', 'Rows affected'] == 1
 
 
 def test_filter_year_and_channel(model):
@@ -170,3 +226,50 @@ def test_unknown_store_is_reported_not_dropped(tables):
     assert analytics.revenue_by(m, 'Channel').set_index('Channel')['Revenue']['Unknown'] == 200
     issues = analytics.sales_quality_issues(tables['Sales'], tables).set_index('Check')
     assert issues.loc['Store ID not in Stores table', 'Rows affected'] == 1
+
+
+# ------------------------------------------------------------- one-box upload
+def _as_files(tables, names=None):
+    """Turn the toy tables into uploaded-file style (name, candidates) pairs.
+    The Survey goes into an Excel workbook with two title rows above the header
+    and an extra 'Documentation' sheet, like the real file."""
+    import io
+    names = names or {t: f'{t}.csv' for t in tables}
+    out = []
+    for t, df in tables.items():
+        if t == 'Survey':
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf) as xw:
+                pd.DataFrame([['E-Presso Market Survey']]).to_excel(xw, sheet_name='Documentation',
+                                                                     index=False, header=False)
+                df.to_excel(xw, sheet_name='Survey Results', index=False, startrow=2)
+            data, name = buf.getvalue(), names.get(t, 'Survey.xlsx').replace('.csv', '.xlsx')
+        else:
+            data, name = df.to_csv(index=False).encode(), names[t]
+        out.append((name, analytics.read_candidates(data, name)))
+    return out
+
+
+def test_files_are_recognised_by_columns_not_names(tables):
+    odd = {'Sales': 'export (3).csv', 'Stores': 'a.csv', 'Products': 'b.csv',
+           'Categories': 'c.csv', 'Survey': 'whatever.xlsx'}
+    found, sources, problems = analytics.identify_tables(_as_files(tables, odd))
+    assert problems == [] and set(found) == set(analytics.TABLE_SPECS)
+    assert sources['Sales'] == 'export (3).csv'
+    assert sources['Survey'] == 'whatever.xlsx / sheet "Survey Results"'
+    m, _ = analytics.build_sales_model(found)
+    assert analytics.total_revenue(m) == 1500
+
+
+def test_missing_column_is_named_for_the_right_file(tables):
+    tables['Sales'] = tables['Sales'].drop(columns=['Revenue'])
+    _, _, problems = analytics.identify_tables(_as_files(tables))
+    assert any('Sales.csv' in p and '**Sales**' in p and 'Revenue' in p for p in problems)
+
+
+def test_missing_file_and_duplicate_file_are_reported(tables):
+    files = _as_files(tables)
+    files = [f for f in files if f[0] != 'Products.csv'] + [files[0]]   # drop Products, repeat Sales
+    _, _, problems = analytics.identify_tables(files)
+    assert any('No file for the **Products** table' in p for p in problems)
+    assert any('Two files look like the **Sales** table' in p for p in problems)

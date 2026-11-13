@@ -216,6 +216,69 @@ TABLE_SPECS = {
 REVENUE_COL = 'Revenue'
 
 
+HEADER_HINTS = {'Sales': 'Sales ID', 'Stores': 'ID', 'Products': 'Product ID',
+                'Categories': 'Category ID', 'Survey': 'Survey ID'}
+
+
+def read_candidates(file_bytes: bytes, filename: str) -> list:
+    """Every table-shaped thing in one uploaded file: one for a CSV, one per
+    sheet for Excel (with the header row found automatically).
+    Returns a list of (sheet_name_or_None, DataFrame)."""
+    name = filename.lower()
+    if name.endswith(TEXT_EXT):
+        return [(None, load_table(file_bytes, filename))]
+    if not name.endswith(EXCEL_EXT):
+        raise ValueError(f'Unsupported file type: {filename}')
+    out = []
+    hints = set(HEADER_HINTS.values())
+    for sheet in excel_sheet_names(file_bytes):
+        peek = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, header=None, nrows=15)
+        hint = next((str(v).strip() for _, row in peek.iterrows() for v in row.values
+                     if str(v).strip() in hints), None)
+        out.append((sheet, load_table(file_bytes, filename, sheet, hint)))
+    return out
+
+
+def identify_tables(files: list) -> tuple[dict, dict, list]:
+    """Work out which uploaded file is which E-Presso table by its columns,
+    so files can be uploaded together under any name.
+    files: list of (filename, [(sheet, DataFrame), ...]) as from read_candidates.
+    Returns (tables, sources, problems): tables maps table name to DataFrame,
+    sources maps table name to 'file' or 'file / sheet', problems are plain messages."""
+    tables, sources, problems, near = {}, {}, [], {}
+    for filename, candidates in files:
+        matched = False
+        for sheet, df in candidates:
+            cols = set(df.columns)
+            full = [t for t, spec in TABLE_SPECS.items() if set(spec['required']) <= cols]
+            if not full:
+                for t, spec in TABLE_SPECS.items():
+                    have = len(set(spec['required']) & cols) / len(spec['required'])
+                    if have >= 0.5 and have > near.get(t, (0,))[0]:
+                        near[t] = (have, filename, missing_columns(df, t))
+                continue
+            table = max(full, key=lambda t: len(TABLE_SPECS[t]['required']))  # most specific
+            where = filename if sheet is None else f'{filename} / sheet "{sheet}"'
+            if table in tables:
+                problems.append(f'Two files look like the **{table}** table: {sources[table]} and {where}. '
+                                'Remove one.')
+            else:
+                tables[table], sources[table] = df, where
+            matched = True
+        if not matched and not any(len(c[1].columns) for c in candidates):
+            problems.append(f'**{filename}** is empty.')
+    for t in TABLE_SPECS:
+        if t in tables:
+            continue
+        if t in near:
+            _, filename, gone = near[t]
+            problems.append(f'**{filename}** looks like the **{t}** table but is missing required '
+                            f'column(s): {", ".join(gone)}.')
+        else:
+            problems.append(f'No file for the **{t}** table yet.')
+    return tables, sources, problems
+
+
 def missing_columns(df: pd.DataFrame, table: str) -> list[str]:
     """Required columns that are not in the uploaded table."""
     return [c for c in TABLE_SPECS[table]['required'] if c not in df.columns]
@@ -273,6 +336,21 @@ def build_sales_model(tables: dict):
     Returns (model, merge_checks)."""
     sales = clean_sales(tables['Sales'])
     checks = []
+
+    # Exact duplicate rows (every column identical) are double entries: keep one.
+    # Rows sharing a Sales ID but with different values are kept and only flagged,
+    # because we cannot tell which one is right.
+    before_rows, before_sum = len(sales), float(sales[REVENUE_COL].sum())
+    sales = sales.drop_duplicates()
+    removed = before_rows - len(sales)
+    checks.append({
+        'Merge': 'Remove exact duplicate Sales rows', 'Join key': '(all columns)',
+        'Rows before': before_rows, 'Rows after': len(sales),
+        'Revenue sum before': before_sum, 'Revenue sum after': float(sales[REVENUE_COL].sum()),
+        'Sales rows with no match': 0,
+        'Explanation': (f'{removed} exact duplicate row(s) removed so revenue is not double-counted.'
+                        if removed else 'OK: no exact duplicate rows.'),
+    })
 
     stores = tables['Stores'].rename(columns={'ID': 'Store ID'}).copy()
     stores['Store ID'] = stores['Store ID'].astype('string').str.strip()
@@ -334,7 +412,8 @@ def sales_quality_issues(sales: pd.DataFrame, tables: dict) -> pd.DataFrame:
         'Excluded from revenue totals.')
     add('Negative or zero Revenue', (s[REVENUE_COL] <= 0).sum(), 'Worth checking; may be returns or errors.')
     add('Blank or invalid Date', s['Date'].isna().sum(), 'Excluded from year/month charts.')
-    add('Duplicate Sales ID', s['Sales ID'].dropna().duplicated().sum(), 'Would double-count revenue.')
+    add('Duplicate Sales ID', s['Sales ID'].dropna().duplicated().sum(),
+        'Exact copies are removed before totals (see Data model tab); rows with the same ID but different values are kept.')
     stores = tables.get('Stores')
     if stores is not None and 'ID' in stores.columns:
         known = set(stores['ID'].astype(str).str.strip())
@@ -394,10 +473,25 @@ def revenue_by(model: pd.DataFrame, *cols: str) -> pd.DataFrame:
     return work.groupby(list(cols), as_index=False)[REVENUE_COL].sum()
 
 
+def complete_years(model: pd.DataFrame) -> list[int]:
+    """Years that have data in all 12 months. Comparing a full year with a
+    partial one (e.g. one month of a new year) would distort growth."""
+    months = model.dropna(subset=['Year', 'Month']).groupby('Year')['Month'].nunique()
+    return sorted(int(y) for y, n in months.items() if n == 12)
+
+
+def partial_years(model: pd.DataFrame) -> list[int]:
+    years = sorted(int(y) for y in model['Year'].dropna().unique())
+    full = set(complete_years(model))
+    return [y for y in years if y not in full]
+
+
 def kpis(model: pd.DataFrame) -> dict:
     """Headline numbers for whatever rows are currently selected."""
     rev = pd.to_numeric(model[REVENUE_COL], errors='coerce')
     by_year = revenue_by(model, 'Year').sort_values('Year')
+    full = complete_years(model)
+    by_year = by_year[by_year['Year'].isin(full)]   # growth uses full years only
     growth = None
     if len(by_year) >= 2 and by_year[REVENUE_COL].iloc[0] > 0:
         first, last = by_year.iloc[0], by_year.iloc[-1]
@@ -410,6 +504,7 @@ def kpis(model: pd.DataFrame) -> dict:
         'rows': int(rev.notna().sum()),
         'website_share_pct': (web / total * 100) if total else None,
         'growth': growth,
+        'partial_years': partial_years(model),
     }
 
 
@@ -523,8 +618,10 @@ def get_revenue_trend(model, by='channel', start_year=None, end_year=None, chann
     years = sorted(sub['Year'].dropna().unique().tolist())
     if len(years) < 2:
         return _error(name, 'At least two years of data are needed to measure a trend.', scope)
-    start = int(start_year) if start_year is not None else years[0]
-    end = int(end_year) if end_year is not None else years[-1]
+    full = complete_years(sub)
+    default = full if len(full) >= 2 else years
+    start = int(start_year) if start_year is not None else default[0]
+    end = int(end_year) if end_year is not None else default[-1]
     for y in (start, end):
         if y not in years:
             return _error(name, f'Year {y} not found in the loaded data. Valid years: {years}', scope)
@@ -543,8 +640,12 @@ def get_revenue_trend(model, by='channel', start_year=None, end_year=None, chann
                      'by_year': {int(y): round(float(v), 2) for y, v in r.items()}})
     rows.sort(key=lambda x: (x['pct_change'] is None, -(x['pct_change'] or 0)))
     declined = [x['group'] for x in rows if x['pct_change'] is not None and x['pct_change'] < 0]
+    partial = [y for y in years if y not in full]
     caveats = BASE_CAVEATS + _missing_caveat(sub) + [
         f'% change compares {end} with {start} only; years in between are shown in by_year.',
+        *([f'Partial year(s) {partial} have fewer than 12 months of data'
+           + (' and were not used as the default start or end.' if start not in partial and end not in partial
+              else '; the comparison uses one of them, so treat it with caution.')] if partial else []),
         ('Groups that declined: ' + ', '.join(declined)) if declined else 'No group declined over this period.']
     return ToolResult(tool=name, value=rows, definition=f'{REVENUE_DEF}, per {by} per year',
                       scope=scope, rows_used=int(work[REVENUE_COL].notna().sum()), caveats=caveats)
