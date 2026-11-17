@@ -1,8 +1,6 @@
 """Main app. Upload the five E-Presso tables, profile them, join them, and
 reconcile total revenue with Power BI.
 Keep calculations in analytics.py and the assistant in agent.py."""
-from pathlib import Path
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -14,7 +12,7 @@ MAX_QUESTIONS = 15  # per-session limit for the assistant
 
 st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
 st.title('E-Presso BI Analyst-Fatima & Aon')
-st.caption('Loaded with the E-Presso data; upload files in the sidebar to replace any table. Every number on this page is '
+st.caption('Upload the five E-Presso tables in the sidebar. Every number on this page is '
            'calculated from the files you upload; nothing is typed into the code.')
 
 
@@ -26,61 +24,38 @@ def cached_read(file_bytes: bytes, filename: str):
 
 
 FILE_TYPES = ['csv', 'txt', 'tsv', 'xlsx', 'xls']
-DATA_DIR = Path(__file__).parent / 'data'   # built-in E-Presso files, loaded when nothing is uploaded
-
-
-def builtin_files() -> list:
-    """The E-Presso files stored in the repository's data folder."""
-    files = []
-    for path in sorted(DATA_DIR.glob('*')):
-        if path.suffix.lower().lstrip('.') in FILE_TYPES:
-            try:
-                files.append((path.name, cached_read(path.read_bytes(), path.name)))
-            except Exception:  # an unreadable built-in file is simply skipped
-                pass
-    return files
-
 
 with st.sidebar:
     st.header('Data')
     uploaded = st.file_uploader(
-        'Optional: upload files to replace the built-in data (CSV or Excel)', type=FILE_TYPES,
+        'Upload all five E-Presso files at once (CSV or Excel)', type=FILE_TYPES,
         accept_multiple_files=True, key='uploads')
-    st.caption('The app starts with the built-in E-Presso data. Upload one or more files to replace '
-               'those tables (e.g. a modified Sales file); tables you do not upload keep the built-in '
-               'version. Files are recognised by their columns, so names do not matter. Remove an '
-               'upload with ✕ to go back to the built-in table.')
+    st.caption('Select the five files together (Ctrl/Cmd + click). Each file is recognised by its '
+               'columns, so file names do not matter. To swap one file (e.g. a modified Sales file), '
+               'remove it with ✕ and add the new one.')
+
+if not uploaded:
+    st.info('Upload the five E-Presso tables in the sidebar to begin: '
+            + ', '.join(analytics.TABLE_SPECS))
+    st.stop()
 
 # ---------------------------------------------------------------- load + identify
-problems = []
-up_read = []
-for f in uploaded or []:
+read, problems = [], []
+for f in uploaded:
     try:
-        up_read.append((f.name, cached_read(f.getvalue(), f.name)))
+        read.append((f.name, cached_read(f.getvalue(), f.name)))
     except Exception as exc:  # readable message instead of a traceback
         problems.append(f'**{f.name}**: could not read the file ({exc}).')
-up_tables, up_sources, up_problems = analytics.identify_tables(up_read, require_all=False)
-problems += up_problems
-default_tables, default_sources, _ = analytics.identify_tables(builtin_files(), require_all=False)
-tables, sources = analytics.merge_with_defaults((up_tables, up_sources),
-                                                (default_tables, default_sources))
-for t in analytics.TABLE_SPECS:
-    if t not in tables:
-        problems.append(f'No file for the **{t}** table: upload one.')
+tables, sources, found_problems = analytics.identify_tables(read)
+problems += found_problems
 
 with st.sidebar:
-    st.markdown('**Tables in use**')
     for t in analytics.TABLE_SPECS:
         st.markdown(f'{"✅" if t in tables else "⬜"} **{t}**' + (f': {sources[t]}' if t in sources else ''))
 
 if problems:
     st.error('Some files cannot be used yet:\n\n' + '\n\n'.join(f'- {p}' for p in problems))
     st.stop()
-
-if up_tables:
-    st.info('Using uploaded data for: ' + ', '.join(up_tables)
-            + '. Built-in data for the rest.' if len(up_tables) < len(analytics.TABLE_SPECS)
-            else 'Using uploaded data for all tables.')
 
 # Not cached on purpose: the joins take well under a second and are always rebuilt
 # from the tables just loaded, so a modified upload can never show stale numbers.

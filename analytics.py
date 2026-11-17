@@ -239,7 +239,7 @@ def read_candidates(file_bytes: bytes, filename: str) -> list:
     return out
 
 
-def identify_tables(files: list, require_all: bool = True) -> tuple[dict, dict, list]:
+def identify_tables(files: list) -> tuple[dict, dict, list]:
     """Work out which uploaded file is which E-Presso table by its columns,
     so files can be uploaded together under any name.
     files: list of (filename, [(sheet, DataFrame), ...]) as from read_candidates.
@@ -252,13 +252,10 @@ def identify_tables(files: list, require_all: bool = True) -> tuple[dict, dict, 
             cols = set(df.columns)
             full = [t for t, spec in TABLE_SPECS.items() if set(spec['required']) <= cols]
             if not full:
-                # Remember only this file's single closest table (largest share of its
-                # required columns present; ties go to the table with more columns).
-                scores = [(len(set(spec['required']) & cols) / len(spec['required']),
-                           len(spec['required']), t) for t, spec in TABLE_SPECS.items()]
-                have, _, t = max(scores)
-                if have >= 0.5 and have > near.get(filename, (0,))[0]:
-                    near[filename] = (have, t, missing_columns(df, t))
+                for t, spec in TABLE_SPECS.items():
+                    have = len(set(spec['required']) & cols) / len(spec['required'])
+                    if have >= 0.5 and have > near.get(t, (0,))[0]:
+                        near[t] = (have, filename, missing_columns(df, t))
                 continue
             table = max(full, key=lambda t: len(TABLE_SPECS[t]['required']))  # most specific
             where = filename if sheet is None else f'{filename} / sheet "{sheet}"'
@@ -270,23 +267,16 @@ def identify_tables(files: list, require_all: bool = True) -> tuple[dict, dict, 
             matched = True
         if not matched and not any(len(c[1].columns) for c in candidates):
             problems.append(f'**{filename}** is empty.')
-    for filename, (_, t, gone) in near.items():
-        problems.append(f'**{filename}** looks like the **{t}** table but is missing required '
-                        f'column(s): {", ".join(gone)}.')
-    nearly = {t for _, t, _ in near.values()}
     for t in TABLE_SPECS:
-        if t not in tables and t not in nearly and require_all:
+        if t in tables:
+            continue
+        if t in near:
+            _, filename, gone = near[t]
+            problems.append(f'**{filename}** looks like the **{t}** table but is missing required '
+                            f'column(s): {", ".join(gone)}.')
+        else:
             problems.append(f'No file for the **{t}** table yet.')
     return tables, sources, problems
-
-
-def merge_with_defaults(uploaded: tuple, defaults: tuple) -> tuple[dict, dict]:
-    """Uploaded tables win; any table not uploaded comes from the built-in files.
-    uploaded and defaults are (tables, sources) pairs from identify_tables."""
-    tables, sources = dict(defaults[0]), {t: f'built-in: {src}' for t, src in defaults[1].items()}
-    tables.update(uploaded[0])
-    sources.update(uploaded[1])
-    return tables, sources
 
 
 def missing_columns(df: pd.DataFrame, table: str) -> list[str]:
