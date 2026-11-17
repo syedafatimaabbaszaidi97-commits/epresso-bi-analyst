@@ -3,7 +3,7 @@
 Team: Fatima, Aon 
 
 ## What this application does
-This app lets an E-Presso manager explore five years of sales (2025–2029) across the website and 20 physical stores. After the five E-Presso data files are uploaded, it checks them for problems, joins them safely, and shows total revenue, website share, growth, and four charts that respond to year, channel, category and store filters. A built-in assistant answers business questions in plain English, such as "Which store declined the most?". Every number it gives comes from one of six tested calculations run on the uploaded data, and it says plainly when the data cannot answer a question, such as anything about profit. Every figure is recalculated from whatever files are uploaded, so an updated dataset works without any code change.
+This app lets an E-Presso manager explore five years of sales (2025–2029) across the website and 20 physical stores. It opens with the five E-Presso data files already loaded, checks them for problems, joins them safely, and shows total revenue, website share, growth, and four charts that respond to year, channel, category and store filters. A built-in assistant answers business questions in plain English, such as "Which store declined the most?". Every number it gives comes from one of six tested calculations run on the uploaded data, and it says plainly when the data cannot answer a question, such as anything about profit. Any table can be replaced by uploading a file, and every figure is recalculated from the data in use, so an updated dataset works without any code change.
 
 ## Live app
 **https://epreapp-bi-analyst-9xtb2kgmfn8rb95kn7luog.streamlit.app/**
@@ -11,17 +11,17 @@ This app lets an E-Presso manager explore five years of sales (2025–2029) acro
 The app sleeps when unused. If it shows a wake-up button, click it and allow about a minute.
 
 ## How to use it
-1. **Upload the five files**, one per box in the sidebar (CSV or Excel):
+1. **Data loads automatically.** The five E-Presso files are stored in the `data/` folder and loaded when the app opens. The sidebar lists each table and where it came from:
 
-   | Box | File | Notes |
+   | Table | Built-in file | Notes |
    |---|---|---|
-   | Sales | `Sales.csv` | Exported from the `Sales` table in Support_EX_B_Sales.accdb |
-   | Stores | `Support_EX_B_Stores.csv` | Tab-delimited; read as supplied |
-   | Products | `Products.csv` | Exported from the `Products` table in the .accdb |
-   | Categories | `Categories.csv` | Exported from the `Categories` table in the .accdb |
-   | Survey | `Support_EX_B_Survey.xlsx` | The `Survey Results` sheet is picked automatically; its header is on row 3 |
+   | Sales | `data/Sales.csv` | Exported from the `Sales` table in Support_EX_B_Sales.accdb |
+   | Stores | `data/Support_EX_B_Stores.csv` | Tab-delimited; read as supplied |
+   | Products | `data/Products.csv` | Exported from the `Products` table in the .accdb |
+   | Categories | `data/Categories.csv` | Exported from the `Categories` table in the .accdb |
+   | Survey | `data/Support_EX_B_Survey.xlsx` | The `Survey Results` sheet is picked automatically; its header is on row 3 |
 
-   Until all five are loaded, the page lists the missing tables. If a file lacks a required column, the app names the column.
+   **To use different data** (for example a modified Sales file), upload one or more files in the sidebar. Each file is recognised by its columns, so its name does not matter. An uploaded table replaces the built-in one; tables you do not upload keep the built-in version. Remove an upload with ✕ to go back. If an uploaded file lacks a required column, the app names the file and the column.
 2. **Data and profile tab:** row counts, missing values, duplicate keys, data types, and data-quality checks for each table.
 3. **Data model tab:** grain statements and the merge checks (rows and revenue before and after every join).
 4. **Dashboard tab:** choose filters (leave one empty to include everything). The Scope line, headline numbers and all four charts update together.
@@ -67,6 +67,7 @@ Channel comes from Stores.`StoreType`: `Website` (SH00) or `Brick & Mortar` (SH0
 - Exact duplicate Sales rows are removed before any total (recorded in the merge checks); rows sharing a Sales ID but with different values are kept and flagged.
 - Growth compares full years only (12 months of data); a partial year is named in a warning.
 - File reading is cached by file contents and the joins are rebuilt on every load, so a modified upload is never shown with old numbers.
+- An uploaded table replaces the built-in table of the same kind; the others stay built-in.
 
 ### Data-quality notes (original data)
 - No blank or duplicate keys, no blank revenue, no duplicate sales rows.
@@ -132,7 +133,7 @@ Filter check: Year 2025 + Website = $3,160,230 in both the app and Power BI.
 
 **$1,000 modified-data test:** Sales ID S0120270601 (SH01 Orlando, June 2027, Brick & Mortar, Beans) changed from $260 to $1,260 in a copy of `Sales.csv`. Uploaded with no code change and no restart: total revenue went from $42,174,440 to $42,175,440, as predicted. Filter, chart and assistant checks: [to be completed].
 
-**Automated tests:** 61 tests (`pytest`) on small made-up tables with hand-checkable answers, covering joins, totals, filters, data-quality handling, each assistant tool, the dispatcher, and the Gemini path with a simulated model.
+**Automated tests:** 62 tests (`pytest`) on small made-up tables with hand-checkable answers, covering joins, totals, filters, data-quality handling, each assistant tool, the dispatcher, and the Gemini path with a simulated model.
 
 ## Limitations
 - **Revenue is not profit.** There is no cost, rent, staffing or cost-of-goods data.
@@ -151,7 +152,7 @@ Filter check: Year 2025 + Website = $3,160,230 in both the app and Power BI.
 | `streamlit_app.py` | Screen layout and interaction |
 | `analytics.py` | Metrics and analytical functions (no Streamlit code) |
 | `agent.py` | Tool registry, dispatcher, rules router, and Gemini assistant |
-| `tests/` | 61 tests with hand-checkable answers (`test_analytics.py`, `test_epresso.py`, `test_agent.py`, `test_llm.py`) |
+| `tests/` | 62 tests with hand-checkable answers (`test_analytics.py`, `test_epresso.py`, `test_agent.py`, `test_llm.py`) |
 | `requirements.txt` | Packages the hosted app needs (streamlit, pandas, plotly, openpyxl, google-genai) |
 
 ## Run it

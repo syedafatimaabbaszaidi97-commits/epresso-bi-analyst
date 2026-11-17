@@ -273,3 +273,19 @@ def test_missing_file_and_duplicate_file_are_reported(tables):
     _, _, problems = analytics.identify_tables(files)
     assert any('No file for the **Products** table' in p for p in problems)
     assert any('Two files look like the **Sales** table' in p for p in problems)
+
+# ------------------------------------------------------------- built-in data
+def test_uploaded_table_replaces_builtin_and_rest_stay(tables):
+    # Built-in: the toy tables (total 1,500). Upload only a Sales file where S3 is
+    # +1,000: total must become 2,500 and the other four tables stay built-in.
+    defaults = analytics.identify_tables(_as_files(tables), require_all=False)
+    changed = tables['Sales'].copy()
+    changed.loc[2, 'Revenue'] += 1000
+    up = analytics.identify_tables(_as_files({'Sales': changed}, {'Sales': 'mine.csv'}),
+                                   require_all=False)
+    assert up[2] == []                       # a partial upload is not an error
+    merged, sources = analytics.merge_with_defaults(up[:2], defaults[:2])
+    assert sources['Sales'] == 'mine.csv'
+    assert sources['Stores'].startswith('built-in:')
+    m, _ = analytics.build_sales_model(merged)
+    assert analytics.total_revenue(m) == 2500
